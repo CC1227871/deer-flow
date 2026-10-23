@@ -598,6 +598,184 @@ def test_get_authorization_header_concurrent_threads_no_deadlock(monkeypatch):
     assert len(post_calls) == 1
 
 
+@pytest.mark.parametrize("owner_outcome", ["exception", "cancelled"])
+def test_get_authorization_header_failed_owner_retries_once_across_event_loops(monkeypatch, owner_outcome):
+    """Two cross-loop waiters share one retry when the first refresh ends early."""
+    post_calls: list[dict[str, Any]] = []
+    post_calls_guard = threading.Lock()
+    first_refresh_started = threading.Event()
+    release_first_failure = threading.Event()
+    replacement_refresh_started = threading.Event()
+    release_replacement = threading.Event()
+    both_waiters_blocked = threading.Event()
+    owner_task_published = threading.Event()
+    owner_context: dict[str, Any] = {}
+    owner_context_guard = threading.Lock()
+    results: dict[str, Any] = {}
+    results_guard = threading.Lock()
+
+    class _ObservedLock:
+        """Keep the real cross-thread lock while exposing deterministic waiter entry."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._waiting = 0
+            self._guard = threading.Lock()
+
+        def acquire(self):
+            with self._guard:
+                self._waiting += 1
+                if self._waiting == 2:
+                    both_waiters_blocked.set()
+            try:
+                return self._lock.acquire()
+            finally:
+                with self._guard:
+                    self._waiting -= 1
+
+        def release(self):
+            self._lock.release()
+
+        def locked(self):
+            return self._lock.locked()
+
+        def release_for_cleanup(self):
+            with self._guard:
+                if self._lock.locked():
+                    self._lock.release()
+
+    async def _wait_for_gate(gate: threading.Event) -> None:
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+
+    class _CoordinatedMockAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url: str, data: dict[str, Any]):
+            with post_calls_guard:
+                post_calls.append({"url": url, "data": data})
+                attempt = len(post_calls)
+
+            if attempt == 1:
+                first_refresh_started.set()
+                if owner_outcome == "exception":
+                    await _wait_for_gate(release_first_failure)
+                    raise RuntimeError("initial OAuth refresh failed")
+                await asyncio.Future()
+
+            if attempt == 2:
+                replacement_refresh_started.set()
+                await _wait_for_gate(release_replacement)
+                return _MockResponse(
+                    {
+                        "access_token": "replacement-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                    }
+                )
+
+            raise AssertionError(f"unexpected OAuth refresh attempt {attempt}")
+
+    monkeypatch.setattr("httpx.AsyncClient", _CoordinatedMockAsyncClient)
+    manager = OAuthTokenManager.from_extensions_config(_oauth_server_config())
+    observed_lock = _ObservedLock()
+    manager._states["secure-http"].lock = observed_lock
+
+    def run_in_own_loop(name: str) -> None:
+        async def invoke() -> Any:
+            request = asyncio.create_task(manager.get_authorization_header("secure-http"))
+            if name == "owner":
+                with owner_context_guard:
+                    owner_context["loop"] = asyncio.get_running_loop()
+                    owner_context["task"] = request
+                owner_task_published.set()
+            try:
+                return await request
+            except BaseException as exc:  # noqa: BLE001 - preserve each caller's outcome
+                return exc
+
+        try:
+            result = asyncio.run(invoke())
+        except BaseException as exc:  # noqa: BLE001 - report thread-level failures too
+            result = exc
+        with results_guard:
+            results[name] = result
+
+    threads = [threading.Thread(target=run_in_own_loop, args=(name,), name=name, daemon=True) for name in ("owner", "waiter-1", "waiter-2")]
+
+    try:
+        threads[0].start()
+        assert owner_task_published.wait(timeout=5), "owner event loop never published its request"
+        assert first_refresh_started.wait(timeout=5), "initial refresh never started"
+        for thread in threads[1:]:
+            thread.start()
+        # Both other loops are confirmed waiting on the held per-server lock
+        # before the owner is allowed to fail or is cancelled.
+        assert both_waiters_blocked.wait(timeout=5), "both refresh waiters did not reach the lock"
+
+        if owner_outcome == "exception":
+            release_first_failure.set()
+        else:
+            with owner_context_guard:
+                owner_loop = owner_context["loop"]
+                owner_task = owner_context["task"]
+            owner_loop.call_soon_threadsafe(owner_task.cancel)
+
+        assert replacement_refresh_started.wait(timeout=5), "no waiter started the replacement refresh"
+        with post_calls_guard:
+            assert len(post_calls) == 2, "waiters started more than one replacement refresh"
+
+        release_replacement.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        still_alive = [thread.name for thread in threads if thread.is_alive()]
+        assert not still_alive, f"caller thread(s) did not finish: {still_alive}"
+
+        with results_guard:
+            caller_results = dict(results)
+        assert set(caller_results) == {"owner", "waiter-1", "waiter-2"}
+        owner_result = caller_results["owner"]
+        if owner_outcome == "exception":
+            assert isinstance(owner_result, RuntimeError)
+            assert str(owner_result) == "initial OAuth refresh failed"
+        else:
+            assert isinstance(owner_result, asyncio.CancelledError)
+
+        assert caller_results["waiter-1"] == "Bearer replacement-token"
+        assert caller_results["waiter-2"] == "Bearer replacement-token"
+        assert len(post_calls) == 2
+
+        cached = asyncio.run(manager.get_authorization_header("secure-http"))
+        assert cached == "Bearer replacement-token"
+        assert len(post_calls) == 2, "the next call should reuse the replacement token"
+    finally:
+        release_first_failure.set()
+        release_replacement.set()
+        with owner_context_guard:
+            owner_loop = owner_context.get("loop")
+            owner_task = owner_context.get("task")
+        if owner_loop is not None and owner_task is not None:
+            try:
+                owner_loop.call_soon_threadsafe(owner_task.cancel)
+            except RuntimeError:
+                pass
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=5)
+        if any(thread.is_alive() for thread in threads):
+            observed_lock.release_for_cleanup()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(timeout=1)
+
+
 def test_get_authorization_header_cancelled_while_waiting_does_not_leak_lock(monkeypatch):
     """A caller cancelled while waiting on the per-server lock must not leak it.
 
